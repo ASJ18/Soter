@@ -5,6 +5,7 @@ import { NotificationType } from './interfaces/notification-job.interface';
 import { Job } from 'bullmq';
 import { DlqService } from '../jobs/dlq.service';
 import { MetricsService } from '../observability/metrics/metrics.service';
+import { NotificationsService } from './notifications.service';
 
 describe('NotificationProcessor', () => {
   let processor: NotificationProcessor;
@@ -14,10 +15,13 @@ describe('NotificationProcessor', () => {
     };
   };
   let metricsMock: {
-  incrementCallbackFailure: jest.Mock;
-  incrementNotificationDeliveryAttempt: jest.Mock;
-  incrementNotificationDeliveryFailureByCategory: jest.Mock;
-};
+    incrementCallbackFailure: jest.Mock;
+    incrementNotificationDeliveryAttempt: jest.Mock;
+    incrementNotificationDeliveryFailureByCategory: jest.Mock;
+  };
+  let notificationsServiceMock: {
+    refreshDeadLetterDepth: jest.Mock;
+  };
 
   const makeJob = (
     overrides: Partial<{
@@ -47,10 +51,13 @@ describe('NotificationProcessor', () => {
       },
     };
     metricsMock = {
-  incrementCallbackFailure: jest.fn(),
-  incrementNotificationDeliveryAttempt: jest.fn(),
-  incrementNotificationDeliveryFailureByCategory: jest.fn(),
-};
+      incrementCallbackFailure: jest.fn(),
+      incrementNotificationDeliveryAttempt: jest.fn(),
+      incrementNotificationDeliveryFailureByCategory: jest.fn(),
+    };
+    notificationsServiceMock = {
+      refreshDeadLetterDepth: jest.fn(),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -68,6 +75,10 @@ describe('NotificationProcessor', () => {
         {
           provide: MetricsService,
           useValue: metricsMock,
+        },
+        {
+          provide: NotificationsService,
+          useValue: notificationsServiceMock,
         },
       ],
     }).compile();
@@ -161,7 +172,7 @@ describe('NotificationProcessor', () => {
   });
 
   describe('onFailed', () => {
-    it('should update outbox record to failed with retryCount increment and lastError when outboxId is present and exhausted', async () => {
+    it('should update outbox record to dead_letter with retryCount increment and lastError when outboxId is present and exhausted', async () => {
       const job = makeJob({ outboxId: 'outbox-abc' });
       job.opts = { attempts: 1 };
       job.attemptsMade = 1;
@@ -177,11 +188,15 @@ describe('NotificationProcessor', () => {
       expect(prismaMock.notificationOutbox.update).toHaveBeenCalledWith({
         where: { id: 'outbox-abc' },
         data: {
-          status: 'failed',
+          status: 'dead_letter',
           retryCount: { increment: 1 },
           lastError: 'Something went wrong',
         },
       });
+
+      expect(
+        notificationsServiceMock.refreshDeadLetterDepth,
+      ).toHaveBeenCalledTimes(1);
     });
 
     it('should keep status enqueued while retries remain and still increment retryCount', async () => {

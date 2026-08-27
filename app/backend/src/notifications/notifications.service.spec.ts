@@ -4,17 +4,22 @@ import { getQueueToken } from '@nestjs/bullmq';
 import { NotificationType } from './interfaces/notification-job.interface';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoggerService } from '../logger/logger.service';
+import { MetricsService } from '../observability/metrics/metrics.service';
 
 describe('NotificationsService', () => {
   let service: NotificationsService;
   let queueMock: jest.Mocked<{ add: jest.Mock }>;
   let loggerMock: { getCorrelationId: jest.Mock };
+  let metricsMock: { setNotificationOutboxDeadLetterDepth: jest.Mock };
   let prismaMock: {
+    $transaction: jest.Mock;
     notificationOutbox: {
       create: jest.Mock;
       update: jest.Mock;
+      updateMany: jest.Mock;
       findUnique: jest.Mock;
       findMany: jest.Mock;
+      count: jest.Mock;
     };
   };
 
@@ -43,8 +48,12 @@ describe('NotificationsService', () => {
     loggerMock = {
       getCorrelationId: jest.fn().mockReturnValue(undefined),
     };
+    metricsMock = {
+      setNotificationOutboxDeadLetterDepth: jest.fn(),
+    };
 
     prismaMock = {
+      $transaction: jest.fn(),
       notificationOutbox: {
         create: jest.fn().mockResolvedValue(mockOutbox),
         update: jest.fn().mockResolvedValue({
@@ -52,8 +61,10 @@ describe('NotificationsService', () => {
           status: 'enqueued',
           jobId: 'job-123',
         }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUnique: jest.fn().mockResolvedValue(mockOutbox),
         findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
       },
     };
 
@@ -71,6 +82,10 @@ describe('NotificationsService', () => {
         {
           provide: LoggerService,
           useValue: loggerMock,
+        },
+        {
+          provide: MetricsService,
+          useValue: metricsMock,
         },
       ],
     }).compile();
@@ -357,6 +372,89 @@ describe('NotificationsService', () => {
       const result = await service.getStuckOutboxRecords();
 
       expect(result).toEqual(stuckRecords);
+    });
+  });
+
+  describe('dead-letter handling', () => {
+    it('should count dead-lettered outbox records', async () => {
+      prismaMock.notificationOutbox.count.mockResolvedValue(3);
+
+      await expect(service.getDeadLetterDepth()).resolves.toBe(3);
+
+      expect(prismaMock.notificationOutbox.count).toHaveBeenCalledWith({
+        where: { status: 'dead_letter' },
+      });
+    });
+
+    it('should expose the dead-letter depth metric on refresh', async () => {
+      prismaMock.notificationOutbox.count.mockResolvedValue(2);
+
+      await service.refreshDeadLetterDepth();
+
+      expect(
+        metricsMock.setNotificationOutboxDeadLetterDepth,
+      ).toHaveBeenCalledWith(2);
+    });
+
+    it('should return paginated dead-letter records with a total', async () => {
+      const items = [{ ...mockOutbox, id: 'dl-1', status: 'dead_letter' }];
+      prismaMock.$transaction.mockResolvedValue([items, 1]);
+
+      const result = await service.getDeadLetterRecords({
+        limit: 10,
+        offset: 0,
+      });
+
+      expect(result).toEqual({ items, total: 1 });
+      expect(prismaMock.$transaction).toHaveBeenCalled();
+    });
+
+    it('should no-op replay when the record is not dead-lettered', async () => {
+      prismaMock.notificationOutbox.findUnique.mockResolvedValue({
+        ...mockOutbox,
+        status: 'sent',
+      });
+
+      await expect(service.replayDeadLetter('outbox-123')).resolves.toEqual({
+        id: 'outbox-123',
+        replayed: false,
+      });
+
+      expect(prismaMock.notificationOutbox.update).not.toHaveBeenCalled();
+    });
+
+    it('should move a dead-lettered record back to enqueued on replay', async () => {
+      prismaMock.notificationOutbox.findUnique.mockResolvedValue({
+        ...mockOutbox,
+        status: 'dead_letter',
+      });
+      prismaMock.notificationOutbox.update.mockResolvedValue({
+        ...mockOutbox,
+        status: 'enqueued',
+      });
+
+      await expect(service.replayDeadLetter('outbox-123')).resolves.toEqual({
+        id: 'outbox-123',
+        replayed: true,
+      });
+
+      expect(prismaMock.notificationOutbox.update).toHaveBeenCalledWith({
+        where: { id: 'outbox-123' },
+        data: { status: 'enqueued', lastError: null },
+      });
+    });
+
+    it('should bulk replay only dead-lettered records and dedupe ids', async () => {
+      prismaMock.notificationOutbox.updateMany.mockResolvedValue({ count: 2 });
+
+      await expect(
+        service.replayDeadLetterBulk(['a', 'b', 'a']),
+      ).resolves.toEqual({ replayed: 2 });
+
+      expect(prismaMock.notificationOutbox.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['a', 'b'] }, status: 'dead_letter' },
+        data: { status: 'enqueued', lastError: null },
+      });
     });
   });
 });

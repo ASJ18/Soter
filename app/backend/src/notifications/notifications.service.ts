@@ -13,6 +13,7 @@ import {
 } from './interfaces/notification-job.interface';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoggerService } from '../logger/logger.service';
+import { MetricsService } from '../observability/metrics/metrics.service';
 
 export interface ActivityFeedItem {
   id: string;
@@ -36,6 +37,7 @@ export class NotificationsService {
     @InjectQueue('notifications') private readonly notificationsQueue: Queue,
     private readonly prisma: PrismaService,
     private readonly loggerService: LoggerService,
+    private readonly metricsService: MetricsService,
   ) {}
 
   async sendEmail(
@@ -194,7 +196,8 @@ export class NotificationsService {
     } = {};
 
     if (filters.outcome) where.outcome = filters.outcome;
-    if (filters.failureCategory) where.failureCategory = filters.failureCategory;
+    if (filters.failureCategory)
+      where.failureCategory = filters.failureCategory;
     if (filters.type) where.outbox = { type: filters.type };
     if (filters.from || filters.to) {
       where.startedAt = {
@@ -229,6 +232,84 @@ export class NotificationsService {
       },
       orderBy: { scheduledFor: 'asc' },
     });
+  }
+
+  /**
+   * Returns dead-lettered outbox records (notifications that exhausted their
+   * retry budget), paginated and newest-first.
+   */
+  async getDeadLetterRecords(filters: {
+    limit?: number;
+    offset?: number;
+  }): Promise<{ items: NotificationOutbox[]; total: number }> {
+    const limit = Math.min(Math.max(filters.limit ?? 50, 1), 200);
+    const offset = Math.max(filters.offset ?? 0, 0);
+    const where = { status: 'dead_letter' as const };
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.notificationOutbox.findMany({
+        where,
+        orderBy: { updatedAt: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      this.prisma.notificationOutbox.count({ where }),
+    ]);
+    return { items, total };
+  }
+
+  /**
+   * Returns the current number of notifications in the dead-letter state.
+   */
+  async getDeadLetterDepth(): Promise<number> {
+    return this.prisma.notificationOutbox.count({
+      where: { status: 'dead_letter' as const },
+    });
+  }
+
+  /**
+   * Recomputes and exposes the dead-letter depth metric. Called whenever a
+   * notification transitions to dead-letter or is replayed out of it.
+   */
+  async refreshDeadLetterDepth(): Promise<void> {
+    const depth = await this.getDeadLetterDepth();
+    this.metricsService.setNotificationOutboxDeadLetterDepth(depth);
+  }
+
+  /**
+   * Moves a single dead-lettered notification back to enqueued for redelivery.
+   * Idempotent: no-ops (returns replayed: false) when the record does not
+   * exist or is not currently in the dead-letter state.
+   */
+  async replayDeadLetter(
+    id: string,
+  ): Promise<{ id: string; replayed: boolean }> {
+    const record = await this.prisma.notificationOutbox.findUnique({
+      where: { id },
+    });
+    if (!record || record.status !== 'dead_letter') {
+      return { id, replayed: false };
+    }
+    await this.prisma.notificationOutbox.update({
+      where: { id },
+      data: { status: 'enqueued', lastError: null },
+    });
+    await this.refreshDeadLetterDepth();
+    return { id, replayed: true };
+  }
+
+  /**
+   * Moves multiple dead-lettered notifications back to enqueued in bulk.
+   * Only records currently in the dead-letter state are replayed.
+   */
+  async replayDeadLetterBulk(ids: string[]): Promise<{ replayed: number }> {
+    const uniqueIds = [...new Set(ids)];
+    if (uniqueIds.length === 0) return { replayed: 0 };
+    const result = await this.prisma.notificationOutbox.updateMany({
+      where: { id: { in: uniqueIds }, status: 'dead_letter' as const },
+      data: { status: 'enqueued', lastError: null },
+    });
+    await this.refreshDeadLetterDepth();
+    return { replayed: result.count };
   }
 
   async getActivityFeed(limit = 30): Promise<ActivityFeedItem[]> {

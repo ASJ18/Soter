@@ -30,7 +30,7 @@ export class NotificationProcessor extends WorkerHost {
     job: Job<NotificationJobData, NotificationResult, string>,
   ): Promise<NotificationResult> {
     this.logger.log(
-      `Processing ${job.data.type} notification for ${job.data.recipient} (attempt ${job.attemptsMade + 1})${job.data.correlationId ? `\[correlationId=${job.data.correlationId}]` : ''}`,
+      `Processing ${job.data.type} notification for ${job.data.recipient} (attempt ${job.attemptsMade + 1})${job.data.correlationId ? `[correlationId=${job.data.correlationId}]` : ''}`,
     );
 
     // Update outbox record: set lastAttemptAt to mark processing start
@@ -113,7 +113,9 @@ export class NotificationProcessor extends WorkerHost {
     );
 
     try {
-      const startedAt = job.processedOn ? new Date(job.processedOn) : new Date();
+      const startedAt = job.processedOn
+        ? new Date(job.processedOn)
+        : new Date();
       const completedAt = new Date();
       await this.prisma.notificationDeliveryAttempt.create({
         data: {
@@ -192,7 +194,9 @@ export class NotificationProcessor extends WorkerHost {
     );
 
     try {
-      const startedAt = job.processedOn ? new Date(job.processedOn) : new Date();
+      const startedAt = job.processedOn
+        ? new Date(job.processedOn)
+        : new Date();
       const completedAt = new Date();
       await this.prisma.notificationDeliveryAttempt.create({
         data: {

@@ -1,5 +1,8 @@
 import { Module } from '@nestjs/common';
-import { PrometheusModule, makeGaugeProvider } from '@willsoto/nestjs-prometheus';
+import {
+  PrometheusModule,
+  makeGaugeProvider,
+} from '@willsoto/nestjs-prometheus';
 import { MetricsController } from './metrics.controller';
 import { MetricsService } from './metrics.service';
 import { metricsProviders } from './metrics.providers';
